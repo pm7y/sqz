@@ -266,9 +266,33 @@ impl CacheManager {
     /// - On cache miss: compress via `pipeline`, persist, return `CacheResult::Fresh`.
     pub fn get_or_compress(
         &self,
+        path: &Path,
+        content: &[u8],
+        pipeline: &CompressionPipeline,
+    ) -> Result<CacheResult> {
+        self.get_or_compress_inner(path, content, pipeline, false)
+    }
+
+    /// Lossless variant used by the file-read MCP tools (`sqz_read_file` /
+    /// `sqz_grep` / `sqz_list_dir`): on a cache miss the content is returned
+    /// faithfully via [`CompressionPipeline::compress_lossless`] (no entropy
+    /// truncation / pruning / re-encoding). The general `compress` tool keeps
+    /// using [`get_or_compress`] for aggressive compression. See issue #32.
+    pub fn get_or_compress_lossless(
+        &self,
+        path: &Path,
+        content: &[u8],
+        pipeline: &CompressionPipeline,
+    ) -> Result<CacheResult> {
+        self.get_or_compress_inner(path, content, pipeline, true)
+    }
+
+    fn get_or_compress_inner(
+        &self,
         _path: &Path,
         content: &[u8],
         pipeline: &CompressionPipeline,
+        lossless: bool,
     ) -> Result<CacheResult> {
         let hash = Self::sha256_hex(content);
 
@@ -298,7 +322,11 @@ impl CacheManager {
                     session_id: "cache".to_string(),
                 };
                 let preset = Preset::default();
-                let compressed = pipeline.compress_lossless(&text, &ctx, &preset)?;
+                let compressed = if lossless {
+                    pipeline.compress_lossless(&text, &ctx, &preset)?
+                } else {
+                    pipeline.compress(&text, &ctx, &preset)?
+                };
                 // Record that we re-sent this content
                 self.record_ref_sent(&hash);
                 return Ok(CacheResult::Fresh { output: compressed });
@@ -314,7 +342,11 @@ impl CacheManager {
                 session_id: "cache".to_string(),
             };
             let preset = Preset::default();
-            let compressed = pipeline.compress_lossless(&text, &ctx, &preset)?;
+            let compressed = if lossless {
+                pipeline.compress_lossless(&text, &ctx, &preset)?
+            } else {
+                pipeline.compress(&text, &ctx, &preset)?
+            };
             // Persist the raw bytes so `sqz expand <prefix>` can round-trip.
             self.store
                 .save_cache_entry_with_original(&hash, &compressed, Some(content))?;
@@ -332,7 +364,11 @@ impl CacheManager {
             session_id: "cache".to_string(),
         };
         let preset = Preset::default();
-        let compressed = pipeline.compress_lossless(&text, &ctx, &preset)?;
+        let compressed = if lossless {
+            pipeline.compress_lossless(&text, &ctx, &preset)?
+        } else {
+            pipeline.compress(&text, &ctx, &preset)?
+        };
         self.store
             .save_cache_entry_with_original(&hash, &compressed, Some(content))?;
         // Record that this content was sent at the current turn
@@ -585,17 +621,15 @@ mod tests {
     }
 
     /// Regression for https://github.com/ojuschugh1/sqz/issues/32 — the MCP
-    /// file-read path (`get_or_compress`, used by sqz_read_file / sqz_grep /
-    /// sqz_list_dir) must return content losslessly, never silently
-    /// truncating source code via entropy truncation.
+    /// file-read path (`get_or_compress_lossless`, used by sqz_read_file /
+    /// sqz_grep / sqz_list_dir) returns content faithfully, while the general
+    /// `compress` tool keeps using the lossy `get_or_compress`.
     #[test]
-    fn get_or_compress_does_not_truncate_source() {
-        let (store, _dir) = in_memory_store();
-        let cm = CacheManager::new(store, u64::MAX);
+    fn get_or_compress_lossless_does_not_truncate_source() {
         let pipeline = make_pipeline();
 
-        // >500 bytes of multi-segment non-JSON "source" that the old lossy
-        // path would entropy-truncate by roughly half.
+        // >500 bytes of multi-segment non-JSON "source" that the lossy path
+        // entropy-truncates by roughly half.
         let mut segs = Vec::new();
         for i in 0..10 {
             if i % 2 == 0 {
@@ -609,11 +643,26 @@ mod tests {
         let content = segs.join("\n\n");
         assert!(content.len() > 500);
 
-        let result = cm
-            .get_or_compress(Path::new("src/lib.rs"), content.as_bytes(), &pipeline)
-            .unwrap();
+        // Lossy path (the general `compress` tool) still truncates.
+        let (s1, _d1) = in_memory_store();
+        let lossy = CacheManager::new(s1, u64::MAX);
+        match lossy
+            .get_or_compress(Path::new("x"), content.as_bytes(), &pipeline)
+            .unwrap()
+        {
+            CacheResult::Fresh { output } => {
+                assert!(output.data.contains("omitted"), "lossy path should truncate");
+            }
+            _ => panic!("expected Fresh on a cold read"),
+        }
 
-        match result {
+        // Lossless path (file tools) keeps every segment.
+        let (s2, _d2) = in_memory_store();
+        let cm = CacheManager::new(s2, u64::MAX);
+        match cm
+            .get_or_compress_lossless(Path::new("src/lib.rs"), content.as_bytes(), &pipeline)
+            .unwrap()
+        {
             CacheResult::Fresh { output } => {
                 assert!(
                     !output.data.contains("omitted"),

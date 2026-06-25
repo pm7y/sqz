@@ -82,16 +82,16 @@ impl CompressionPipeline {
         self.compress_inner(input, ctx, preset, false)
     }
 
-    /// Lossless compression for faithful file reads (`sqz_read_file`,
-    /// `sqz_grep`, `sqz_list_dir`). Runs only transforms that keep content
-    /// faithful and self-describing — ANSI stripping, RLE run-collapsing
-    /// (`line [×N]`), and TOON re-encoding for JSON. Skips every stage that
-    /// *drops* content (entropy truncation, token pruning, JSON field
-    /// projection, and the lossy configured stages: condense, strip_fields,
-    /// strip_nulls, flatten, truncate_strings, collapse_arrays, git_diff_fold)
-    /// as well as sliding-window dedup, whose `[→Ln]` back-references make a
-    /// file read non-faithful. No source line, JSON field, or segment is ever
-    /// silently removed.
+    /// Byte-faithful compression for file reads (`sqz_read_file`, `sqz_grep`,
+    /// `sqz_list_dir`). Returns the input verbatim apart from ANSI-escape
+    /// stripping: every content-altering stage is skipped — both the droppers
+    /// (entropy truncation, token pruning, JSON field projection, and the lossy
+    /// configured stages: condense, strip_fields, strip_nulls, flatten,
+    /// truncate_strings, collapse_arrays, git_diff_fold) and the
+    /// reversible-but-reformatting ones (RLE, sliding-window dedup, TOON/dict),
+    /// which would shift bytes or line numbers. No line, field, or segment is
+    /// ever dropped or moved. Token savings on this path come from the dedup
+    /// `§ref` cache on repeat reads, not from re-encoding.
     /// See https://github.com/ojuschugh1/sqz/issues/32
     pub fn compress_lossless(
         &self,
@@ -153,9 +153,10 @@ impl CompressionPipeline {
             }
         }
 
-        // RLE: collapse repeated patterns in non-JSON content (generalizes condense)
-        // Only apply when content is long enough to benefit
-        if !is_json && content.raw.len() > 200 {
+        // RLE: collapse repeated patterns in non-JSON content (generalizes condense).
+        // Skipped on the lossless path — even reversible `[×N]` markers make a
+        // file read non-verbatim. Only apply when content is long enough.
+        if !lossless && !is_json && content.raw.len() > 200 {
             if let Ok(rle_result) = crate::rle_compressor::rle_compress(&content.raw, 3) {
                 if rle_result.runs_collapsed > 0 {
                     // Safety check: verify critical markers are preserved
@@ -208,8 +209,11 @@ impl CompressionPipeline {
             }
         }
 
-        // Apply dictionary compression + TOON encoding for JSON
-        let data = if ToonEncoder::is_json(&content.raw) {
+        // Apply dictionary compression + TOON encoding for JSON.
+        // Skipped on the lossless path so a JSON file read returns its bytes
+        // verbatim — TOON re-encoding is data-lossless but reformats and
+        // shifts line numbers, which breaks "read this file faithfully".
+        let data = if !lossless && ToonEncoder::is_json(&content.raw) {
             // Dictionary compression — observe and try to compress.
             // Only use dict compression if it actually saves bytes (header overhead
             // can make small payloads larger).
@@ -415,8 +419,6 @@ fn stage_config_from_preset(name: &str, preset: &Preset) -> StageConfig {
     }
 }
 
-/// Heuristic: does this text look like prose (documentation, error messages,
-/// README content) rather than code or structured data?
 /// Whether a configured stage is safe to run on the lossless file-read path.
 /// Only stages that never drop or irreversibly alter content qualify; every
 /// other stage (condense, strip_fields, strip_nulls, flatten, truncate_strings,
@@ -425,6 +427,8 @@ fn stage_is_lossless(name: &str) -> bool {
     matches!(name, "ansi_strip" | "custom_transforms")
 }
 
+/// Heuristic: does this text look like prose (documentation, error messages,
+/// README content) rather than code or structured data?
 fn looks_like_prose(text: &str) -> bool {
     let lines: Vec<&str> = text.lines().take(20).collect();
     if lines.is_empty() {
@@ -585,43 +589,29 @@ mod tests {
         assert!(!lossless.stages_applied.contains(&"token_prune".to_owned()));
     }
 
-    /// The lossless path must preserve JSON faithfully — no stripped nulls,
-    /// collapsed arrays, truncated strings, or projected-away fields.
+    /// The lossless path returns JSON byte-for-byte — no stripped nulls,
+    /// collapsed arrays, truncated strings, projected-away fields, or TOON
+    /// re-encoding (which would shift line numbers).
     #[test]
     fn compress_lossless_preserves_json_fields() {
         let preset = default_preset();
         let pipeline = CompressionPipeline::new(&preset);
         let json = r#"{"keep":1,"gone":null,"items":[1,2,3,4,5,6,7,8],"note":"x"}"#;
 
-        // Sanity: the default path strips the null (strip_nulls is enabled).
+        // Sanity: the default path transforms the JSON (strips the null,
+        // TOON-encodes), so it differs from the input.
         let lossy = pipeline.compress(json, &ctx(), &preset).unwrap();
-        let lossy_decoded = ToonEncoder.decode(&lossy.data).unwrap();
-        assert!(
-            lossy_decoded.get("gone").is_none(),
-            "sanity: default path should strip the null"
-        );
+        assert_ne!(lossy.data, json, "default path should transform JSON");
 
-        // The lossless path keeps every field, every array item, and the null.
+        // The lossless path returns the JSON verbatim.
         let result = pipeline.compress_lossless(json, &ctx(), &preset).unwrap();
-        let decoded = ToonEncoder.decode(&result.data).unwrap();
-        assert_eq!(decoded["keep"], serde_json::json!(1));
-        assert_eq!(
-            decoded["gone"],
-            serde_json::Value::Null,
-            "lossless dropped the null field"
-        );
-        assert_eq!(
-            decoded["items"],
-            serde_json::json!([1, 2, 3, 4, 5, 6, 7, 8]),
-            "lossless collapsed the array"
-        );
-        assert_eq!(decoded["note"], serde_json::json!("x"));
+        assert_eq!(result.data, json, "lossless must return JSON byte-for-byte");
     }
 
-    /// Lossless is not a passthrough: reversible dedup (RLE / sliding-window)
-    /// still runs, so repetitive content is still compressed — recoverably.
+    /// Even highly repetitive content is returned verbatim on the lossless
+    /// path — RLE `[×N]` collapsing is skipped so a file read stays faithful.
     #[test]
-    fn compress_lossless_still_dedups_repeated_lines() {
+    fn compress_lossless_returns_repeated_lines_verbatim() {
         let preset = default_preset();
         let pipeline = CompressionPipeline::new(&preset);
         let line = "this is a repeated diagnostic line that is quite long\n";
@@ -631,21 +621,19 @@ mod tests {
         );
         assert!(input.len() > 300);
 
+        // Default path collapses the repeated run; lossless returns it untouched.
+        let lossy = pipeline.compress(&input, &ctx(), &preset).unwrap();
+        assert!(
+            lossy.data.len() < input.len(),
+            "default path should collapse repeats"
+        );
+
         let result = pipeline.compress_lossless(&input, &ctx(), &preset).unwrap();
-        assert!(
-            result.data.len() < input.len(),
-            "lossless should still shrink repetitive content; got {} vs {}",
-            result.data.len(),
-            input.len()
+        assert_eq!(
+            result.data, input,
+            "lossless must return repeated content verbatim"
         );
-        assert!(
-            result.stages_applied.contains(&"rle".to_owned())
-                || result
-                    .stages_applied
-                    .contains(&"sliding_window_dedup".to_owned()),
-            "a reversible dedup stage should fire; stages: {:?}",
-            result.stages_applied
-        );
+        assert!(!result.stages_applied.contains(&"rle".to_owned()));
     }
 
     #[test]
