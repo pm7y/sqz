@@ -831,27 +831,25 @@ mod tests {
     #[test]
     fn ref_refreshed_after_resend() {
         let (store, _dir) = in_memory_store();
-        // TTL of 10ms: a fresh send bumps accessed_at, so immediately after
-        // the re-send the ref is fresh again.
-        let cm = CacheManager::with_ref_age_duration(
-            store,
-            u64::MAX,
-            Duration::from_millis(10),
-        );
+        // Generous TTL so the "fresh after re-send" check is never a timing
+        // race on a slow CI runner; staleness is forced via compaction below.
+        let cm = CacheManager::with_ref_age_duration(store, u64::MAX, Duration::from_secs(86_400));
         let pipeline = make_pipeline();
         let content = b"hello world";
         let path = Path::new("file.txt");
 
         cm.get_or_compress(path, content, &pipeline).unwrap();
-        // Wait past the TTL so the entry is stale.
-        std::thread::sleep(std::time::Duration::from_millis(25));
+        // Force staleness deterministically: set the compaction marker strictly
+        // after the seed's accessed_at, so the ref predates it (no TTL race).
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        cm.notify_compaction();
 
-        // Stale — must re-send Fresh. The re-send bumps accessed_at.
+        // Stale (predates the marker) — must re-send Fresh. The re-send bumps
+        // accessed_at past the marker.
         let result = cm.get_or_compress(path, content, &pipeline).unwrap();
         assert!(matches!(result, CacheResult::Fresh { .. }));
 
-        // Immediately read again — the freshly-updated accessed_at is
-        // within the 10ms TTL, so the ref is fresh.
+        // Now fresh (accessed_at after the marker, within the generous TTL).
         let result = cm.get_or_compress(path, content, &pipeline).unwrap();
         assert!(
             matches!(result, CacheResult::Dedup { .. }),
@@ -861,25 +859,23 @@ mod tests {
 
     #[test]
     fn check_dedup_returns_none_for_stale_ref() {
-        let (store, _dir) = in_memory_store();
-        let cm = CacheManager::with_ref_age_duration(
-            store,
-            u64::MAX,
-            Duration::from_millis(10),
-        );
         let pipeline = make_pipeline();
         let content = b"test content";
         let path = Path::new("file.txt");
 
-        cm.get_or_compress(path, content, &pipeline).unwrap();
+        // Fresh ref (generous TTL): check_dedup returns Some.
+        let (store, _dir) = in_memory_store();
+        let fresh =
+            CacheManager::with_ref_age_duration(store, u64::MAX, Duration::from_secs(86_400));
+        fresh.get_or_compress(path, content, &pipeline).unwrap();
+        assert!(fresh.check_dedup(content).unwrap().is_some());
 
-        // Immediately fresh.
-        assert!(cm.check_dedup(content).unwrap().is_some());
-
-        // Wait past TTL.
-        std::thread::sleep(std::time::Duration::from_millis(25));
+        // Stale ref (TTL=0): check_dedup returns None — deterministic, no sleep.
+        let (store2, _dir2) = in_memory_store();
+        let stale = CacheManager::with_ref_age_duration(store2, u64::MAX, Duration::ZERO);
+        stale.get_or_compress(path, content, &pipeline).unwrap();
         assert!(
-            cm.check_dedup(content).unwrap().is_none(),
+            stale.check_dedup(content).unwrap().is_none(),
             "stale ref should not be returned by check_dedup"
         );
     }
