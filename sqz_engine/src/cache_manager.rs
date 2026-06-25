@@ -298,7 +298,7 @@ impl CacheManager {
                     session_id: "cache".to_string(),
                 };
                 let preset = Preset::default();
-                let compressed = pipeline.compress(&text, &ctx, &preset)?;
+                let compressed = pipeline.compress_lossless(&text, &ctx, &preset)?;
                 // Record that we re-sent this content
                 self.record_ref_sent(&hash);
                 return Ok(CacheResult::Fresh { output: compressed });
@@ -314,7 +314,7 @@ impl CacheManager {
                 session_id: "cache".to_string(),
             };
             let preset = Preset::default();
-            let compressed = pipeline.compress(&text, &ctx, &preset)?;
+            let compressed = pipeline.compress_lossless(&text, &ctx, &preset)?;
             // Persist the raw bytes so `sqz expand <prefix>` can round-trip.
             self.store
                 .save_cache_entry_with_original(&hash, &compressed, Some(content))?;
@@ -332,7 +332,7 @@ impl CacheManager {
             session_id: "cache".to_string(),
         };
         let preset = Preset::default();
-        let compressed = pipeline.compress(&text, &ctx, &preset)?;
+        let compressed = pipeline.compress_lossless(&text, &ctx, &preset)?;
         self.store
             .save_cache_entry_with_original(&hash, &compressed, Some(content))?;
         // Record that this content was sent at the current turn
@@ -582,6 +582,53 @@ mod tests {
             .get_or_compress(Path::new("file.txt"), content, &pipeline)
             .unwrap();
         assert!(matches!(result, CacheResult::Fresh { .. }));
+    }
+
+    /// Regression for https://github.com/ojuschugh1/sqz/issues/32 — the MCP
+    /// file-read path (`get_or_compress`, used by sqz_read_file / sqz_grep /
+    /// sqz_list_dir) must return content losslessly, never silently
+    /// truncating source code via entropy truncation.
+    #[test]
+    fn get_or_compress_does_not_truncate_source() {
+        let (store, _dir) = in_memory_store();
+        let cm = CacheManager::new(store, u64::MAX);
+        let pipeline = make_pipeline();
+
+        // >500 bytes of multi-segment non-JSON "source" that the old lossy
+        // path would entropy-truncate by roughly half.
+        let mut segs = Vec::new();
+        for i in 0..10 {
+            if i % 2 == 0 {
+                segs.push(format!("SEG{i} llllllllllllllllllllllllllllllllllllllll"));
+            } else {
+                segs.push(format!(
+                    "SEG{i} the quick brown fox jumps over {i} lazy dogs by rivers"
+                ));
+            }
+        }
+        let content = segs.join("\n\n");
+        assert!(content.len() > 500);
+
+        let result = cm
+            .get_or_compress(Path::new("src/lib.rs"), content.as_bytes(), &pipeline)
+            .unwrap();
+
+        match result {
+            CacheResult::Fresh { output } => {
+                assert!(
+                    !output.data.contains("omitted"),
+                    "file-read path truncated content: {}",
+                    output.data
+                );
+                for i in 0..10 {
+                    assert!(
+                        output.data.contains(&format!("SEG{i}")),
+                        "file-read path dropped SEG{i}"
+                    );
+                }
+            }
+            _ => panic!("expected CacheResult::Fresh on a cold read"),
+        }
     }
 
     #[test]
